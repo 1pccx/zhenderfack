@@ -1,5 +1,6 @@
 # Must to set your controller IP here
-CONTROLLER_IP = '192.168.2.179'
+CONTROLLER_IP = '192.168.8.132'
+
 
 # Controller port is 51234 by default.
 # If you want to change the port number

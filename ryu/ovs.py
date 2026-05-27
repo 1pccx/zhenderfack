@@ -39,12 +39,15 @@ class SimpleSwitch13(app_manager.RyuApp):
         self.snort.start_socket_server()
 
         self.snort_alert_ips = {}
+        self.dli_results = {}
 
         self.conn = None
         self.cursor = None
         self.is_connecting = False
         # Start DB connection in a background thread so it doesn't block Ryu's OpenFlow server startup!
         threading.Thread(target=self.connect_db, daemon=True).start()
+        # Start DLI socket listener in a background thread to receive real-time predictions from the rack
+        threading.Thread(target=self.start_dli_socket_listener, daemon=True).start()
 
     def connect_db(self):
         if getattr(self, 'is_connecting', False):
@@ -75,6 +78,74 @@ class SimpleSwitch13(app_manager.RyuApp):
             self.cursor = None
         finally:
             self.is_connecting = False
+
+    def start_dli_socket_listener(self):
+        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            server_socket.bind((cfg.DLI_LISTEN_HOST, cfg.DLI_LISTEN_PORT))
+            server_socket.listen(5)
+            self.logger.info("DLI Socket Listener started on %s:%s", cfg.DLI_LISTEN_HOST, cfg.DLI_LISTEN_PORT)
+        except Exception as e:
+            self.logger.error("Failed to start DLI Socket Listener on %s:%s - %s", cfg.DLI_LISTEN_HOST, cfg.DLI_LISTEN_PORT, e)
+            return
+
+        while True:
+            try:
+                client_sock, client_addr = server_socket.accept()
+                self.logger.info("Accepted DLI connection from %s", client_addr)
+                
+                # Handle connection in a separate thread so it doesn't block the listening loop
+                threading.Thread(target=self.handle_dli_connection, args=(client_sock,), daemon=True).start()
+            except Exception as e:
+                self.logger.error("Error in DLI Socket Listener accept loop: %s", e)
+                time.sleep(1)
+
+    def handle_dli_connection(self, client_sock):
+        try:
+            data = client_sock.recv(1024)
+            if data:
+                payload = json.loads(data.decode('utf-8'))
+                src_ip = payload.get("src_ip")
+                result = payload.get("result") # 0 = benign, 1 = malicious
+                
+                if src_ip is not None and result is not None:
+                    self.logger.info("Received DLI prediction for %s: result=%s", src_ip, result)
+                    self.dli_results[src_ip] = (result, time.time())
+                    
+                    # Update local database in a thread-safe manner
+                    label = 'malicious' if result == 1 else 'benign'
+                    risk_level = '高' if result == 1 else '低'
+                    if self.conn and self.conn.closed == 0:
+                        try:
+                            # Update the latest command from this IP that hasn't been labeled yet
+                            sql = """
+                            UPDATE incoming_commands
+                            SET predicted_label = %s, risk_level = %s
+                            WHERE id = (
+                                SELECT id FROM incoming_commands
+                                WHERE src_ip = %s AND predicted_label IS NULL
+                                ORDER BY id DESC LIMIT 1
+                            );
+                            """
+                            with self.conn.cursor() as cur:
+                                cur.execute(sql, (label, risk_level, src_ip))
+                            self.conn.commit()
+                            self.logger.info("Updated local database with DLI result for %s", src_ip)
+                        except Exception as db_err:
+                            self.logger.error("Failed to update local DB with DLI prediction: %s", db_err)
+                            if self.conn:
+                                try:
+                                    self.conn.rollback()
+                                except Exception:
+                                    pass
+        except Exception as e:
+            self.logger.error("Error handling DLI socket connection: %s", e)
+        finally:
+            try:
+                client_sock.close()
+            except Exception:
+                pass
 
     def add_flow(self, datapath, priority, match, actions, idle_timeout=5):
         parser = datapath.ofproto_parser
@@ -175,6 +246,15 @@ class SimpleSwitch13(app_manager.RyuApp):
         return 0
 
     def get_dli_result(self, src_ip):
+        # 1. Check in-memory real-time DLI results first
+        now = time.time()
+        if src_ip in self.dli_results:
+            result, timestamp = self.dli_results[src_ip]
+            if now - timestamp <= cfg.DLI_RESULT_TIMEOUT:
+                self.logger.info("Found real-time DLI result in memory for %s: %s", src_ip, result)
+                return result
+
+        # 2. Fallback to database query if not found in memory
         if not self.conn or self.conn.closed != 0:
             if not getattr(self, 'is_connecting', False):
                 threading.Thread(target=self.connect_db, daemon=True).start()

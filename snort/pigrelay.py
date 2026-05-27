@@ -4,8 +4,9 @@ import time
 
 SOCKFILE = "/tmp/snort_alert"
 
-CONTROLLER_IP = "127.0.0.1"
+CONTROLLER_IP = "192.168.8.132"
 CONTROLLER_PORT = 51234
+
 
 if os.path.exists(SOCKFILE):
     os.unlink(SOCKFILE)
