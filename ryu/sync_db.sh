@@ -28,9 +28,12 @@ REMOTE_SSH_IP="140.130.34.85"
 REMOTE_SSH_PORT="52739"
 REMOTE_DB_USER="postgres"
 REMOTE_DB_NAME="security_db"
+REMOTE_DB_PASS="1234567890"  # Remote rack database password
 
 LOCAL_DB_USER="data_user"
 LOCAL_DB_NAME="security_db"
+LOCAL_DB_PASS="1234567890"   # Local Ryu database password
+
 
 print_status "Starting DB Sync Pipeline..."
 
@@ -41,8 +44,8 @@ if [ -f "$LOCAL_SQL_FILE" ] && [ -s "$LOCAL_SQL_FILE" ]; then
     # Temporarily rename to prevent concurrent writes from writing to the file we are uploading
     mv "$LOCAL_SQL_FILE" "${LOCAL_SQL_FILE}.tmp"
     
-    # Upload via SSH pipeline
-    if cat "${LOCAL_SQL_FILE}.tmp" | ssh -p "$REMOTE_SSH_PORT" "${REMOTE_SSH_USER}@${REMOTE_SSH_IP}" "psql -h localhost -U $REMOTE_DB_USER -d $REMOTE_DB_NAME" >/dev/null; then
+    # Upload via SSH pipeline (establishing the master connection) - ONLY uploading the last log statement
+    if tac "${LOCAL_SQL_FILE}.tmp" | sed -n '1,/INSERT INTO/p' | tac | ssh -o ConnectTimeout=5 -o ControlMaster=auto -o ControlPath=/tmp/ssh_mux_%h_%p_%r -o ControlPersist=10 -p "$REMOTE_SSH_PORT" "${REMOTE_SSH_USER}@${REMOTE_SSH_IP}" "PGPASSWORD=$REMOTE_DB_PASS psql -h localhost -U $REMOTE_DB_USER -d $REMOTE_DB_NAME" >/dev/null; then
         print_status "Successfully uploaded packet logs to Rack DB."
         rm -f "${LOCAL_SQL_FILE}.tmp"
     else
@@ -58,9 +61,9 @@ fi
 print_status "Pulling ML prediction results from Remote Rack DB..."
 
 # This SQL dynamically generates UPDATE commands on the rack and pipes them straight into the local Postgres CLI
-SYNC_SQL="SELECT 'UPDATE incoming_commands SET predicted_label = ''' || predicted_label || ''', risk_level = ''' || risk_level || ''' WHERE src_ip = ''' || src_ip || ''';' FROM incoming_commands WHERE predicted_label IS NOT NULL AND created_at >= NOW() - INTERVAL '5 minutes';"
+SYNC_SQL="SELECT 'UPDATE incoming_commands SET predicted_label = ''' || predicted_label || ''', risk_level = ''' || risk_level || ''' WHERE src_ip = ''' || src_ip || ''';' FROM incoming_commands WHERE predicted_label IS NOT NULL AND created_at >= NOW() - INTERVAL '1 day';"
 
-if ssh -p "$REMOTE_SSH_PORT" "${REMOTE_SSH_USER}@${REMOTE_SSH_IP}" "psql -h localhost -U $REMOTE_DB_USER -d $REMOTE_DB_NAME -t -A -c \"$SYNC_SQL\"" | psql -h localhost -U $LOCAL_DB_USER -d $LOCAL_DB_NAME >/dev/null; then
+if ssh -o ConnectTimeout=5 -o ControlMaster=auto -o ControlPath=/tmp/ssh_mux_%h_%p_%r -p "$REMOTE_SSH_PORT" "${REMOTE_SSH_USER}@${REMOTE_SSH_IP}" "PGPASSWORD=$REMOTE_DB_PASS psql -h localhost -U $REMOTE_DB_USER -d $REMOTE_DB_NAME -t -A -c \"$SYNC_SQL\"" | PGPASSWORD=$LOCAL_DB_PASS psql -h localhost -U $LOCAL_DB_USER -d $LOCAL_DB_NAME >/dev/null; then
     print_status "Successfully synchronized ML predictions into local DB!"
 else
     print_error "Failed to pull prediction results from remote DB."

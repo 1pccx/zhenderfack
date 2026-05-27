@@ -21,6 +21,14 @@ def connect_controller():
     while True:
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            
+            # Enable TCP Keepalive to prevent VMware NAT from dropping idle connections
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            # Send keepalive probe after 3 seconds of idleness, retry 3 times every 3 seconds
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 3)
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 3)
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+            
             s.connect((CONTROLLER_IP, CONTROLLER_PORT))
             print(f"[*] Connected to Ryu {CONTROLLER_IP}:{CONTROLLER_PORT}")
             return s

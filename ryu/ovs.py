@@ -40,6 +40,7 @@ class SimpleSwitch13(app_manager.RyuApp):
 
         self.snort_alert_ips = {}
         self.dli_results = {}
+        self.local_ip = self.get_local_ip()
 
         self.conn = None
         self.cursor = None
@@ -48,6 +49,18 @@ class SimpleSwitch13(app_manager.RyuApp):
         threading.Thread(target=self.connect_db, daemon=True).start()
         # Start DLI socket listener in a background thread to receive real-time predictions from the rack
         threading.Thread(target=self.start_dli_socket_listener, daemon=True).start()
+
+    def get_local_ip(self):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            self.logger.info("Automatically detected Ryu VM local IP: %s", ip)
+            return ip
+        except Exception:
+            # Fallback to config
+            return getattr(cfg, "NORMAL_SERVER_IP", "192.168.8.132")
 
     def connect_db(self):
         if getattr(self, 'is_connecting', False):
@@ -252,13 +265,13 @@ class SimpleSwitch13(app_manager.RyuApp):
             result, timestamp = self.dli_results[src_ip]
             if now - timestamp <= cfg.DLI_RESULT_TIMEOUT:
                 self.logger.info("Found real-time DLI result in memory for %s: %s", src_ip, result)
-                return result
+                return result, "DLI_MEMORY_CACHE"
 
         # 2. Fallback to database query if not found in memory
         if not self.conn or self.conn.closed != 0:
             if not getattr(self, 'is_connecting', False):
                 threading.Thread(target=self.connect_db, daemon=True).start()
-            return 0
+            return 0, "DLI_OFFLINE_FALLBACK"
 
         try:
             sql = """
@@ -273,10 +286,10 @@ class SimpleSwitch13(app_manager.RyuApp):
                 
             if row:
                 label = row[0]
-                if label == 'malicious':
-                    return 1
-                elif label == 'benign':
-                    return 0
+                if label in ['malicious', '1', 1]:
+                    return 1, "DLI_DATABASE_MATCH"
+                elif label in ['benign', '0', 0]:
+                    return 0, "DLI_DATABASE_MATCH"
         except Exception as e:
             self.logger.error("DB QUERY ERROR in get_dli_result: %s", e)
             if self.conn:
@@ -284,7 +297,7 @@ class SimpleSwitch13(app_manager.RyuApp):
                     self.conn.rollback()
                 except Exception:
                     pass
-        return 0
+        return 0, "DLI_OFFLINE_FALLBACK"
 
     def nor_gate(self, snort_result, dli_result):
         if snort_result == 0 and dli_result == 0:
@@ -328,8 +341,6 @@ class SimpleSwitch13(app_manager.RyuApp):
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
-        print("PACKET IN RECEIVED")
-
         msg = ev.msg
         datapath = msg.datapath
 
@@ -354,26 +365,35 @@ class SimpleSwitch13(app_manager.RyuApp):
         src_ip = ip_pkt.src
         dst_ip = ip_pkt.dst
 
-        # Bypass redirection for external internet traffic (pings, DNS, database connects)
-        # to ensure Ryu VM maintains full outbound internet access!
-        is_external = dst_ip.startswith("8.8.") or dst_ip == "140.130.34.85" or src_ip == "140.130.34.85"
-        if is_external:
-            actions = [parser.OFPActionOutput(ofproto.OFPP_NORMAL)]
-            self.packet_out(datapath, msg, in_port, actions)
-            return
-
         tcp_pkt = pkt.get_protocol(tcp.tcp)
         udp_pkt = pkt.get_protocol(udp.udp)
 
         protocol = "IP"
         dst_port = 0
+        src_port = 0
 
         if tcp_pkt:
             protocol = "TCP"
             dst_port = tcp_pkt.dst_port
+            src_port = tcp_pkt.src_port
         elif udp_pkt:
             protocol = "UDP"
             dst_port = udp_pkt.dst_port
+            src_port = udp_pkt.src_port
+
+        # Bypass redirection for external internet traffic (pings, DNS, database connects)
+        # to ensure Ryu VM maintains full outbound internet access!
+        is_external = dst_ip.startswith("8.8.") or dst_ip == "140.130.34.85" or src_ip == "140.130.34.85"
+        
+        # Bypass redirection for local management/service ports on Ryu VM (SSH, PostgreSQL, Snort Port, DLI Port)
+        # We must bypass BOTH inbound packets to Ryu (check dst_port) and outbound responses from Ryu (check src_port)
+        is_inbound_local = dst_ip == self.local_ip and dst_port in [22, 5432, cfg.snortport, cfg.DLI_LISTEN_PORT]
+        is_outbound_local = src_ip == self.local_ip and src_port in [22, 5432, cfg.snortport, cfg.DLI_LISTEN_PORT]
+
+        if is_external or is_inbound_local or is_outbound_local:
+            actions = [parser.OFPActionOutput(ofproto.OFPP_NORMAL)]
+            self.packet_out(datapath, msg, in_port, actions)
+            return
 
         command_text = self._get_packet_payload_text(msg, protocol, dst_port)
 
@@ -387,7 +407,7 @@ class SimpleSwitch13(app_manager.RyuApp):
             self.logger.error("DB ERROR: %s", e)
 
         snort_result = self.get_snort_result(src_ip)
-        dli_result = self.get_dli_result(src_ip)
+        dli_result, dli_source = self.get_dli_result(src_ip)
 
         decision = self.nor_gate(
             snort_result,
@@ -402,10 +422,11 @@ class SimpleSwitch13(app_manager.RyuApp):
             target_port = cfg.NORMAL_SERVER_PORT
 
         self.logger.info(
-            "NOR src=%s snort=%s dli=%s decision=%s target=%s:%s",
+            "NOR src=%s snort=%s dli=%s [%s] decision=%s target=%s:%s",
             src_ip,
             snort_result,
             dli_result,
+            dli_source,
             decision,
             target_ip,
             target_port

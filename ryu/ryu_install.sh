@@ -87,7 +87,7 @@ else
 fi
 
 print_status "Installing Python packages for Ryu and PostgreSQL integration..."
-python3.9 -m pip install "setuptools==67.6.1" wheel
+python3.9 -m pip install "setuptools==67.6.1" wheel pbr
 python3.9 -m pip install "dnspython==1.16.0"
 python3.9 -m pip install "eventlet==0.30.2"
 python3.9 -m pip install --no-build-isolation "ryu==4.34"
